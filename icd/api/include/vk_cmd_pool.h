@@ -83,6 +83,14 @@ public:
 
     bool IsProtected() const { return m_flags.isProtected ? true : false; }
 
+    // Marks command buffer as needing an explicit reset when this cmd
+    // pool is reset.
+    Pal::Result MarkExplicitlyResetCmdBuf(CmdBuffer* pCmdBuffer);
+
+    // Removes `pCmdBuffer` from the set of command buffers to reset
+    // explicitly.
+    void UnmarkExplicitlyResetCmdBuf(CmdBuffer* pCmdBuffer);
+
 private:
     PAL_DISALLOW_COPY_AND_ASSIGN(CmdPool);
 
@@ -113,6 +121,11 @@ private:
     } m_flags;
 
     Util::HashSet<CmdBuffer*, PalAllocator> m_cmdBufferRegistry;
+
+    // Command buffes that need to be explicitly reset on cmd pool reset.
+    Util::HashSet<CmdBuffer*, PalAllocator> m_cmdBufsForExplicitReset;
+    // Indicates that the command pool is currently being reset.
+    bool m_poolResetInProgress = false;
 };
 
 namespace entry

@@ -60,7 +60,8 @@ CmdPool::CmdPool(
     m_pAllocator(pAllocator),
     m_queueFamilyIndex(queueFamilyIndex),
     m_sharedCmdAllocator(sharedCmdAllocator),
-    m_cmdBufferRegistry(32, pDevice->VkInstance()->Allocator())
+    m_cmdBufferRegistry(32, pDevice->VkInstance()->Allocator()),
+    m_cmdBufsForExplicitReset(32, pDevice->VkInstance()->Allocator())
 {
     m_flags.u32All = 0;
 
@@ -77,6 +78,11 @@ CmdPool::CmdPool(
 VkResult CmdPool::Init()
 {
     Pal::Result palResult = m_cmdBufferRegistry.Init();
+
+    if (palResult == Pal::Result::Success)
+    {
+        palResult = m_cmdBufsForExplicitReset.Init();
+    }
 
     return PalToVkResult(palResult);
 }
@@ -258,13 +264,15 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
 {
     VkResult result = VK_SUCCESS;
 
+    m_poolResetInProgress = true;
+
     // There's currently no way to tell to the PAL CmdAllocator that it should release the actual allocations used
     // by the pool, it always just marks the allocations unused, so we currently ignore the
     // VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT flag if present.
     VK_IGNORE(flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
 
-    // We first have to reset all the command buffers that use this pool (PAL doesn't do this automatically).
-    for (auto it = m_cmdBufferRegistry.Begin(); (it.Get() != nullptr) && (result == VK_SUCCESS); it.Next())
+    // We first have to reset all the command buffers that are marked for explicit reset (PAL doesn't do this automatically).
+    for (auto it = m_cmdBufsForExplicitReset.Begin(); (it.Get() != nullptr) && (result == VK_SUCCESS); it.Next())
     {
         // Per-spec we always have to do a command buffer reset that also releases the used resources.
         result = it.Get()->key->Reset(VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
@@ -272,6 +280,15 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
 
     if (result == VK_SUCCESS)
     {
+        // Clear the set of command buffers to reset. Only done if all the
+        // buffers were reset successfully so it is possible that after an error
+        // this set will contain already reset command buffers. This is fine
+        // because we can reset command buffers twice.
+        if (m_cmdBufsForExplicitReset.GetNumEntries() > 0)
+        {
+            m_cmdBufsForExplicitReset.Reset();
+        }
+
         // After resetting the registered command buffers, reset the pool itself but only if we use per-pool
         // CmdAllocator objects, not a single shared one.
         if (m_sharedCmdAllocator == false)
@@ -279,6 +296,8 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
             result = ResetCmdAllocator();
         }
     }
+
+    m_poolResetInProgress = false;
 
     return result;
 }
@@ -294,7 +313,38 @@ Pal::Result CmdPool::RegisterCmdBuffer(CmdBuffer* pCmdBuffer)
 // Unregister a command buffer from this pool.
 void CmdPool::UnregisterCmdBuffer(CmdBuffer* pCmdBuffer)
 {
+    // Remove the buffer from the list of explicitly reset buffers if
+    // needed.
+    UnmarkExplicitlyResetCmdBuf(pCmdBuffer);
     m_cmdBufferRegistry.Erase(pCmdBuffer);
+}
+
+// =====================================================================================================================
+// Marks command buffer as needing an explicit reset when this cmd
+// pool is reset.
+Pal::Result CmdPool::MarkExplicitlyResetCmdBuf(CmdBuffer* pCmdBuffer)
+{
+    // If a reset is in progress we can't update the list of cmd buffers to
+    // reset.
+    VK_ASSERT(!m_poolResetInProgress);
+    return m_cmdBufsForExplicitReset.Insert(pCmdBuffer);
+}
+
+// =====================================================================================================================
+// Removes `pCmdBuffer` from the set of command buffers to reset
+// explicitly.
+void CmdPool::UnmarkExplicitlyResetCmdBuf(CmdBuffer* pCmdBuffer)
+{
+    // If a reset is in progress we can't update the list of command buffers to
+    // reset because it may be used. It is safe to ignore this operation since
+    // command pool objects are externally synchronized, so
+    // UnmarkExplicitlyResetCmdBuf can only be called from CmdBuffer::End() done
+    // as a part of the pool reset.
+    if (m_poolResetInProgress)
+    {
+        return;
+    }
+    m_cmdBufsForExplicitReset.Erase(pCmdBuffer);
 }
 
 /**

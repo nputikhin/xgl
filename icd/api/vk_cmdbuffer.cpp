@@ -1117,6 +1117,7 @@ VkResult CmdBuffer::Begin(
     VK_ASSERT(!m_flags.isRecording);
 
     m_flags.wasBegun = true;
+    m_pCmdPool->MarkExplicitlyResetCmdBuf(this);
 
     // Beginning a command buffer implicitly resets its state
     ResetState();
@@ -1523,6 +1524,16 @@ VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags)
         result = PalToVkResult(PalCmdBufferReset(nullptr, releaseResources));
 
         m_flags.wasBegun = false;
+
+        // Notify the pool that the buffer won't need to be reset. Only done
+        // when pool reset won't perform any work - if
+        // m_flags.disableResetReleaseResources is not set and resources were
+        // not released the command buffer will still need to be reset during
+        // pool reset.
+        if (releaseResources || m_flags.disableResetReleaseResources)
+        {
+            m_pCmdPool->UnmarkExplicitlyResetCmdBuf(this);
+        }
     }
 
     return result;
