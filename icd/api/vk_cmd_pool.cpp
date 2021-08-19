@@ -271,11 +271,20 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
     // VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT flag if present.
     VK_IGNORE(flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
 
+
+#if PAL_CLIENT_INTERFACE_MAJOR_VERSION >= 675 // TODO: Use the actual number when deferred reset is supported by PAL.
+    // We may only use deferred PAL cmd buffer reset when the allocator is reset
+    // here because we rely on allocator reset.
+    const bool deferPalCmdBufferReset = !m_sharedCmdAllocator;
+#else
+    const bool deferPalCmdBufferReset = false;
+#endif
+
     // We first have to reset all the command buffers that are marked for explicit reset (PAL doesn't do this automatically).
     for (auto it = m_cmdBufsForExplicitReset.Begin(); (it.Get() != nullptr) && (result == VK_SUCCESS); it.Next())
     {
         // Per-spec we always have to do a command buffer reset that also releases the used resources.
-        result = it.Get()->key->Reset(VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
+        result = it.Get()->key->Reset(VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT, deferPalCmdBufferReset);
     }
 
     if (result == VK_SUCCESS)

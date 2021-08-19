@@ -302,7 +302,10 @@ public:
     VkResult Begin(
         const VkCommandBufferBeginInfo*             pBeginInfo);
 
-    VkResult Reset(VkCommandBufferResetFlags flags);
+    // deferPalCmdBufferReset causes PAL command buffers to not be reset
+    // and instead get reset at Begin or explicit reset time. It is intended to
+    // be used by cmd pool reset.
+    VkResult Reset(VkCommandBufferResetFlags flags, bool deferPalCmdBufferReset);
 
     VkResult End(void);
 

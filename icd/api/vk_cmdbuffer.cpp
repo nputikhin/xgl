@@ -1495,7 +1495,7 @@ void CmdBuffer::ResetState()
 
 // =====================================================================================================================
 // Reset Vulkan command buffer
-VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags)
+VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags, bool deferPalBufferReset)
 {
     VkResult result = VK_SUCCESS;
     bool releaseResources = ((flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) != 0);
@@ -1521,7 +1521,10 @@ VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags)
             ReleaseResources();
         }
 
-        result = PalToVkResult(PalCmdBufferReset(nullptr, releaseResources));
+        if (!deferPalBufferReset)
+        {
+            result = PalToVkResult(PalCmdBufferReset(nullptr, releaseResources));
+        }
 
         m_flags.wasBegun = false;
 
@@ -7715,7 +7718,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandBuffer(
     VkCommandBuffer                             cmdBuffer,
     VkCommandBufferResetFlags                   flags)
 {
-    return ApiCmdBuffer::ObjectFromHandle(cmdBuffer)->Reset(flags);
+    return ApiCmdBuffer::ObjectFromHandle(cmdBuffer)->Reset(flags, false);
 }
 
 // =====================================================================================================================
