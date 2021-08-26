@@ -477,7 +477,8 @@ CmdBuffer::CmdBuffer(
     m_pSqttState(nullptr),
     m_renderPassInstance(pDevice->VkInstance()->Allocator()),
     m_pTransformFeedbackState(nullptr),
-    m_palDepthStencilState(pDevice->VkInstance()->Allocator())
+    m_palDepthStencilState(pDevice->VkInstance()->Allocator()),
+    m_knownCmdPoolResourceGeneration(pCmdPool->GetInstanceResourceGeneration())
 {
     m_flags.wasBegun = false;
 
@@ -1117,7 +1118,7 @@ VkResult CmdBuffer::Begin(
     VK_ASSERT(!m_flags.isRecording);
 
     m_flags.wasBegun = true;
-    m_pCmdPool->MarkExplicitlyResetCmdBuf(this);
+    ClearInvalidatedResources();
 
     // Beginning a command buffer implicitly resets its state
     ResetState();
@@ -1256,7 +1257,7 @@ VkResult CmdBuffer::Begin(
     {
         if (m_pStackAllocator == nullptr)
         {
-            result = m_pDevice->VkInstance()->StackMgr()->AcquireAllocator(&m_pStackAllocator);
+            result = m_pCmdPool->AcquireAllocator(&m_pStackAllocator);
         }
     }
 
@@ -1281,6 +1282,7 @@ VkResult CmdBuffer::Begin(
     }
 
     m_flags.isRecording = true;
+    m_pCmdPool->MarkExplicitlyResetCmdBuf(this);
 
     if (pRenderPass
         ) // secondary VkCommandBuffer will be used inside VkRenderPass
@@ -1405,6 +1407,11 @@ VkResult CmdBuffer::End(void)
 
     m_flags.isRecording = false;
 
+    if (m_recordingResult == VK_SUCCESS && result == Pal::Result::Success)
+    {
+        m_pCmdPool->UnmarkExplicitlyResetCmdBuf(this);
+    }
+
     return (m_recordingResult == VK_SUCCESS ? PalToVkResult(result) : m_recordingResult);
 }
 
@@ -1494,8 +1501,29 @@ void CmdBuffer::ResetState()
 }
 
 // =====================================================================================================================
+// Cleans up resources that have been invalidated by the command pool.
+void CmdBuffer::ClearInvalidatedResources()
+{
+    if (m_pCmdPool->GetInstanceResourceGeneration() == m_knownCmdPoolResourceGeneration)
+    {
+        return;
+    }
+
+    m_palDepthStencilState.Clear();
+
+    m_renderPassInstance.pAttachments       = nullptr;
+    m_renderPassInstance.maxAttachmentCount = 0;
+
+    m_renderPassInstance.pSamplePatterns = nullptr;
+    m_renderPassInstance.maxSubpassCount = 0;
+
+    m_pStackAllocator = nullptr;
+    m_knownCmdPoolResourceGeneration = m_pCmdPool->GetInstanceResourceGeneration();
+}
+
+// =====================================================================================================================
 // Reset Vulkan command buffer
-VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags, bool deferPalBufferReset)
+VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags)
 {
     VkResult result = VK_SUCCESS;
     bool releaseResources = ((flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) != 0);
@@ -1521,10 +1549,7 @@ VkResult CmdBuffer::Reset(VkCommandBufferResetFlags flags, bool deferPalBufferRe
             ReleaseResources();
         }
 
-        if (!deferPalBufferReset)
-        {
-            result = PalToVkResult(PalCmdBufferReset(nullptr, releaseResources));
-        }
+        result = PalToVkResult(PalCmdBufferReset(nullptr, releaseResources));
 
         m_flags.wasBegun = false;
 
@@ -1885,14 +1910,13 @@ VkResult CmdBuffer::Destroy(void)
 // =====================================================================================================================
 void CmdBuffer::ReleaseResources()
 {
-    auto              pInstance = m_pDevice->VkInstance();
-    RenderStateCache* pRSCache  = m_pDevice->GetRenderStateCache();
+    ClearInvalidatedResources();
 
     for (uint32_t i = 0; i < m_palDepthStencilState.NumElements(); ++i)
     {
         DynamicDepthStencil palDepthStencilState = m_palDepthStencilState.At(i);
 
-        pRSCache->DestroyDepthStencilState(palDepthStencilState.pPalDepthStencil, pInstance->GetAllocCallbacks());
+        m_pCmdPool->DestroyDepthStencilState(palDepthStencilState.pPalDepthStencil);
     }
 
     m_palDepthStencilState.Clear();
@@ -1900,7 +1924,7 @@ void CmdBuffer::ReleaseResources()
     // Release per-attachment render pass instance memory
     if (m_renderPassInstance.pAttachments != nullptr)
     {
-        pInstance->FreeMem(m_renderPassInstance.pAttachments);
+        m_pCmdPool->FreeMem(m_renderPassInstance.pAttachments);
 
         m_renderPassInstance.pAttachments       = nullptr;
         m_renderPassInstance.maxAttachmentCount = 0;
@@ -1909,7 +1933,7 @@ void CmdBuffer::ReleaseResources()
     // Release per-subpass instance memory
     if (m_renderPassInstance.pSamplePatterns != nullptr)
     {
-        pInstance->FreeMem(m_renderPassInstance.pSamplePatterns);
+        m_pCmdPool->FreeMem(m_renderPassInstance.pSamplePatterns);
 
         m_renderPassInstance.pSamplePatterns = nullptr;
         m_renderPassInstance.maxSubpassCount = 0;
@@ -1917,7 +1941,7 @@ void CmdBuffer::ReleaseResources()
 
     if (m_pStackAllocator != nullptr)
     {
-        pInstance->StackMgr()->ReleaseAllocator(m_pStackAllocator);
+        m_pCmdPool->ReleaseAllocator(m_pStackAllocator);
 
         m_pStackAllocator = nullptr;
     }
@@ -5512,7 +5536,7 @@ void CmdBuffer::BeginRenderPass(
         // Free old memory
         if (m_renderPassInstance.pAttachments != nullptr)
         {
-            m_pDevice->VkInstance()->FreeMem(m_renderPassInstance.pAttachments);
+            m_pCmdPool->FreeMem(m_renderPassInstance.pAttachments);
 
             m_renderPassInstance.pAttachments       = nullptr;
             m_renderPassInstance.maxAttachmentCount = 0;
@@ -5522,7 +5546,7 @@ void CmdBuffer::BeginRenderPass(
         const size_t maxAttachmentCount = Util::Max(attachmentCount, 8U);
 
         m_renderPassInstance.pAttachments = static_cast<RenderPassInstanceState::AttachmentState*>(
-            m_pDevice->VkInstance()->AllocMem(
+            m_pCmdPool->AllocMem(
                 sizeof(RenderPassInstanceState::AttachmentState) * maxAttachmentCount,
                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT));
 
@@ -5544,7 +5568,7 @@ void CmdBuffer::BeginRenderPass(
         // Free old memory
         if (m_renderPassInstance.pSamplePatterns != nullptr)
         {
-            m_pDevice->VkInstance()->FreeMem(m_renderPassInstance.pSamplePatterns);
+            m_pCmdPool->FreeMem(m_renderPassInstance.pSamplePatterns);
 
             m_renderPassInstance.pSamplePatterns = nullptr;
             m_renderPassInstance.maxSubpassCount = 0;
@@ -5552,7 +5576,7 @@ void CmdBuffer::BeginRenderPass(
 
         // Allocate enough to cover new requirements
         m_renderPassInstance.pSamplePatterns = static_cast<SamplePattern*>(
-            m_pDevice->VkInstance()->AllocMem(
+            m_pCmdPool->AllocMem(
                 sizeof(SamplePattern) * subpassCount,
                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT));
 
@@ -7388,18 +7412,15 @@ void CmdBuffer::ValidateStates()
 
             if (m_allGpuState.dirtyGraphics.depthStencil)
             {
-                RenderStateCache* pRSCache = m_pDevice->GetRenderStateCache();
-
                 // Check pPalDepthStencil[0] should be fine since pPalDepthStencil[i] would be nullptr when
                 // pPalDepthStencil[0] is nullptr.
                 if (pPalDepthStencil[0] == nullptr)
                 {
                     bool depthStencilExist = false;
 
-                    pRSCache->CreateDepthStencilState(m_allGpuState.depthStencilCreateInfo,
-                                                      m_pDevice->VkInstance()->GetAllocCallbacks(),
-                                                      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
-                                                      pPalDepthStencil);
+                    m_pCmdPool->CreateDepthStencilState(m_allGpuState.depthStencilCreateInfo,
+                                                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT,
+                                                        pPalDepthStencil);
 
                     // Check if pPalDepthStencil is already in the m_allGpuState.palDepthStencilState, destroy it
                     // and use the old one if yes. The destroy is not expensive since it's just a refCount--.
@@ -7412,8 +7433,7 @@ void CmdBuffer::ValidateStates()
                         {
                             depthStencilExist = true;
 
-                            pRSCache->DestroyDepthStencilState(pPalDepthStencil,
-                                                               m_pDevice->VkInstance()->GetAllocCallbacks());
+                            m_pCmdPool->DestroyDepthStencilState(pPalDepthStencil);
 
                             for (uint32_t j = 0; j < MaxPalDevices; ++j)
                             {
@@ -7718,7 +7738,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandBuffer(
     VkCommandBuffer                             cmdBuffer,
     VkCommandBufferResetFlags                   flags)
 {
-    return ApiCmdBuffer::ObjectFromHandle(cmdBuffer)->Reset(flags, false);
+    return ApiCmdBuffer::ObjectFromHandle(cmdBuffer)->Reset(flags);
 }
 
 // =====================================================================================================================

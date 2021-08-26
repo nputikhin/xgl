@@ -302,10 +302,7 @@ public:
     VkResult Begin(
         const VkCommandBufferBeginInfo*             pBeginInfo);
 
-    // deferPalCmdBufferReset causes PAL command buffers to not be reset
-    // and instead get reset at Begin or explicit reset time. It is intended to
-    // be used by cmd pool reset.
-    VkResult Reset(VkCommandBufferResetFlags flags, bool deferPalCmdBufferReset);
+    VkResult Reset(VkCommandBufferResetFlags flags);
 
     VkResult End(void);
 
@@ -1053,6 +1050,9 @@ private:
 
     void ResetState();
 
+    // Cleans up resources that have been invalidated by the command pool.
+    void ClearInvalidatedResources();
+
     VK_INLINE void CalcCounterBufferAddrs(
         uint32_t            firstCounterBuffer,
         uint32_t            counterBufferCount,
@@ -1236,6 +1236,8 @@ private:
 
     uint32                        m_vbWatermark;  // tracks how many vb entries need to be reset
 
+    // Stores the last known pool generation number to detect resource invalidation
+    uint64                        m_knownCmdPoolResourceGeneration;
 };
 
 // =====================================================================================================================

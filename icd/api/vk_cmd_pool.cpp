@@ -61,7 +61,10 @@ CmdPool::CmdPool(
     m_queueFamilyIndex(queueFamilyIndex),
     m_sharedCmdAllocator(sharedCmdAllocator),
     m_cmdBufferRegistry(32, pDevice->VkInstance()->Allocator()),
-    m_cmdBufsForExplicitReset(32, pDevice->VkInstance()->Allocator())
+    m_cmdBufsForExplicitReset(32, pDevice->VkInstance()->Allocator()),
+    m_palDepthStencilStates(32, pDevice->VkInstance()->Allocator()),
+    m_resettableInstanceAllocs(32, pDevice->VkInstance()->Allocator()),
+    m_stackAllocators(32, pDevice->VkInstance()->Allocator())
 {
     m_flags.u32All = 0;
 
@@ -69,6 +72,9 @@ CmdPool::CmdPool(
     {
         m_flags.isProtected = true;
     }
+
+    const RuntimeSettings& settings = m_pDevice->GetRuntimeSettings();
+    m_flags.disableResetReleaseResources = settings.disableResetReleaseResources;
 
     memcpy(m_pPalCmdAllocators, pPalCmdAllocators, sizeof(pPalCmdAllocators[0]) * pDevice->NumPalDevices());
 }
@@ -82,6 +88,21 @@ VkResult CmdPool::Init()
     if (palResult == Pal::Result::Success)
     {
         palResult = m_cmdBufsForExplicitReset.Init();
+    }
+
+    if (palResult == Pal::Result::Success)
+    {
+        palResult = m_palDepthStencilStates.Init();
+    }
+
+    if (palResult == Pal::Result::Success)
+    {
+        palResult = m_resettableInstanceAllocs.Init();
+    }
+
+    if (palResult == Pal::Result::Success)
+    {
+        palResult = m_stackAllocators.Init();
     }
 
     return PalToVkResult(palResult);
@@ -270,7 +291,11 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
     // by the pool, it always just marks the allocations unused, so we currently ignore the
     // VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT flag if present.
     VK_IGNORE(flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
-
+    bool needToReleaseResources = flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+    if (m_flags.disableResetReleaseResources)
+    {
+        needToReleaseResources = false;
+    }
 
 #if PAL_CLIENT_INTERFACE_MAJOR_VERSION >= 675 // TODO: Use the actual number when deferred reset is supported by PAL.
     // We may only use deferred PAL cmd buffer reset when the allocator is reset
@@ -280,11 +305,13 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
     const bool deferPalCmdBufferReset = false;
 #endif
 
+    auto& bufsToReset = deferPalCmdBufferReset ? m_cmdBufsForExplicitReset : m_cmdBufferRegistry;
+
     // We first have to reset all the command buffers that are marked for explicit reset (PAL doesn't do this automatically).
-    for (auto it = m_cmdBufsForExplicitReset.Begin(); (it.Get() != nullptr) && (result == VK_SUCCESS); it.Next())
+    for (auto it = bufsToReset.Begin(); (it.Get() != nullptr) && (result == VK_SUCCESS); it.Next())
     {
         // Per-spec we always have to do a command buffer reset that also releases the used resources.
-        result = it.Get()->key->Reset(VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT, deferPalCmdBufferReset);
+        result = it.Get()->key->Reset(VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT);
     }
 
     if (result == VK_SUCCESS)
@@ -296,6 +323,50 @@ VkResult CmdPool::Reset(VkCommandPoolResetFlags flags)
         if (m_cmdBufsForExplicitReset.GetNumEntries() > 0)
         {
             m_cmdBufsForExplicitReset.Reset();
+        }
+
+        if (needToReleaseResources)
+        {
+            // Release resources that are being held by the command buffers.
+            // The CBs will synchronize their state later either on begin or free.
+            // Resource resets are gated by GetNumEntries() because resetting
+            // empty hashsets is not free, although in this instance the difference
+            // is pretty small.
+
+            if (m_palDepthStencilStates.GetNumEntries() > 0)
+            {
+                RenderStateCache* pRSCache = m_pDevice->GetRenderStateCache();
+                for (auto it = m_palDepthStencilStates.Begin(); it.Get() != nullptr; it.Next())
+                {
+                    // Undo each state creation performed by cmd buffers in the pool.
+                    for (uint32 i = 0; i < it.Get()->value; ++i)
+                    {
+                        pRSCache->DestroyDepthStencilState(it.Get()->key,
+                                                           m_pDevice->VkInstance()->GetAllocCallbacks());
+                    }
+                }
+                m_palDepthStencilStates.Reset();
+            }
+
+            if (m_resettableInstanceAllocs.GetNumEntries() > 0)
+            {
+                for (auto it = m_resettableInstanceAllocs.Begin(); it.Get() != nullptr; it.Next())
+                {
+                    m_pDevice->VkInstance()->FreeMem(it.Get()->key);
+                }
+                m_resettableInstanceAllocs.Reset();
+            }
+
+            if (m_stackAllocators.GetNumEntries() > 0)
+            {
+                for (auto it = m_stackAllocators.Begin(); it.Get() != nullptr; it.Next())
+                {
+                    m_pDevice->VkInstance()->StackMgr()->ReleaseAllocator(it.Get()->key);
+                }
+                m_stackAllocators.Reset();
+            }
+
+            ++m_instanceResourceGeneration;
         }
 
         // After resetting the registered command buffers, reset the pool itself but only if we use per-pool
@@ -354,6 +425,109 @@ void CmdPool::UnmarkExplicitlyResetCmdBuf(CmdBuffer* pCmdBuffer)
         return;
     }
     m_cmdBufsForExplicitReset.Erase(pCmdBuffer);
+}
+
+// =====================================================================================================================
+// Forwards the call to RenderStateCache saving the output to
+// the internal set with resouces to be returned on Reset().
+Pal::Result CmdPool::CreateDepthStencilState(
+    const Pal::DepthStencilStateCreateInfo& createInfo,
+    VkSystemAllocationScope                 parentScope,
+    Pal::IDepthStencilState*                pStates[MaxPalDevices])
+{
+    RenderStateCache* pRSCache = m_pDevice->GetRenderStateCache();
+    Pal::Result palResult = pRSCache->CreateDepthStencilState(createInfo,
+                                                              m_pDevice->VkInstance()->GetAllocCallbacks(),
+                                                              parentScope,
+                                                              pStates);
+
+    if (palResult == Pal::Result::Success)
+    {
+        bool existed = false;
+        uint32* pCount = nullptr;
+        palResult = m_palDepthStencilStates.FindAllocate(pStates, &existed, &pCount);
+        if (palResult == Pal::Result::Success)
+        {
+            if (existed)
+            {
+                ++(*pCount);
+            }
+            else
+            {
+                *pCount = 1;
+            }
+        }
+    }
+    return palResult;
+}
+
+// =====================================================================================================================
+// Forwards the call to RenderStateCache and removes `ppStates` from
+// the tracked set.
+void CmdPool::DestroyDepthStencilState(Pal::IDepthStencilState** ppStates)
+{
+    RenderStateCache* pRSCache = m_pDevice->GetRenderStateCache();
+    pRSCache->DestroyDepthStencilState(ppStates,
+                                       m_pDevice->VkInstance()->GetAllocCallbacks());
+    uint32* pCount = m_palDepthStencilStates.FindKey(ppStates);
+    PAL_ASSERT(pCount);
+    PAL_ASSERT(*pCount > 0);
+    if (*pCount > 0)
+    {
+        --(*pCount);
+    }
+    if (*pCount == 0)
+    {
+        m_palDepthStencilStates.Erase(ppStates);
+    }
+}
+
+
+// =====================================================================================================================
+// Allocates instance memory saving the output to the tracked set
+// with resouces to be returned on Reset().
+void* CmdPool::AllocMem(size_t size, VkSystemAllocationScope allocType)
+{
+    void* pMem = m_pDevice->VkInstance()->AllocMem(size, allocType);
+    if (pMem != nullptr)
+    {
+        m_resettableInstanceAllocs.Insert(pMem);
+    }
+    return pMem;
+}
+
+// =====================================================================================================================
+// Frees instance memory and removes `pMem` from the tracked set.
+void CmdPool::FreeMem(void* pMem)
+{
+    m_pDevice->VkInstance()->FreeMem(pMem);
+    if (pMem != nullptr)
+    {
+        PAL_ASSERT(m_resettableInstanceAllocs.Contains(pMem));
+        m_resettableInstanceAllocs.Erase(pMem);
+    }
+}
+
+// =====================================================================================================================
+// Acquires a virtual stack alocator from the instance saving the
+// output to the tracked set with resouces to be returned on Reset().
+Pal::Result CmdPool::AcquireAllocator(VirtualStackAllocator** ppAllocator)
+{
+    Pal::Result palResult = m_pDevice->VkInstance()->StackMgr()->AcquireAllocator(ppAllocator);
+    if (palResult == Pal::Result::Success)
+    {
+        palResult = m_stackAllocators.Insert(*ppAllocator);
+    }
+    return palResult;
+}
+
+// =====================================================================================================================
+// Releases `pAllocator` and removes it from the tracked set.
+void CmdPool::ReleaseAllocator(VirtualStackAllocator* pAllocator)
+{
+    PAL_ASSERT(m_stackAllocators.Contains(pAllocator));
+    m_pDevice->VkInstance()->StackMgr()->ReleaseAllocator(pAllocator);
+    m_stackAllocators.Erase(pAllocator);
 }
 
 /**

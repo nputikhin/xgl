@@ -91,6 +91,36 @@ public:
     // explicitly.
     void UnmarkExplicitlyResetCmdBuf(CmdBuffer* pCmdBuffer);
 
+    // Returns the generation nubmer that is increased each reset that
+    // releases resources.
+    // CmdBuffers use it to detect resource invalidation.
+    uint64 GetInstanceResourceGeneration() const { return m_instanceResourceGeneration; }
+
+    // Forwards the call to RenderStateCache saving the output to
+    // the tracked set with resouces to be returned on Reset().
+    Pal::Result CreateDepthStencilState(
+        const Pal::DepthStencilStateCreateInfo& createInfo,
+        VkSystemAllocationScope                 parentScope,
+        Pal::IDepthStencilState*                pStates[MaxPalDevices]);
+
+    // Forwards the call to RenderStateCache and removes `ppStates` from
+    // the tracked set.
+    void DestroyDepthStencilState(Pal::IDepthStencilState** ppStates);
+
+    // Allocates instance memory saving the output to the tracked set
+    // with resouces to be returned on Reset().
+    void* AllocMem(size_t size, VkSystemAllocationScope allocType);
+
+    // Frees instance memory and removes `pMem` from the tracked set.
+    void FreeMem(void* pMem);
+
+    // Acquires a virtual stack alocator from the instance saving the
+    // output to the tracked set with resouces to be returned on Reset().
+    Pal::Result AcquireAllocator(VirtualStackAllocator** ppAllocator);
+
+    // Releases `pAllocator` and removes it from the tracked set.
+    void ReleaseAllocator(VirtualStackAllocator* pAllocator);
+
 private:
     PAL_DISALLOW_COPY_AND_ASSIGN(CmdPool);
 
@@ -114,8 +144,9 @@ private:
     {
         struct
         {
-            uint32 isProtected : 1;
-            uint32 reserved    : 31;
+            uint32 isProtected                  : 1;
+            uint32 disableResetReleaseResources : 1;
+            uint32 reserved                     : 30;
         };
         uint32 u32All;
     } m_flags;
@@ -126,6 +157,19 @@ private:
     Util::HashSet<CmdBuffer*, PalAllocator> m_cmdBufsForExplicitReset;
     // Indicates that the command pool is currently being reset.
     bool m_poolResetInProgress = false;
+
+    // Tracked states to be released on Reset().
+    // This is a map to a count because the cache may return the same state
+    // several times. A multiset would have been better here but it is not
+    // present in PAL.
+    Util::HashMap<Pal::IDepthStencilState**, uint32, PalAllocator> m_palDepthStencilStates;
+    // Tracked instance allocations to be released on Reset().
+    Util::HashSet<void*, PalAllocator> m_resettableInstanceAllocs;
+    // Tracked virtual stack allocators to be released on Reset().
+    Util::HashSet<VirtualStackAllocator*, PalAllocator> m_stackAllocators;
+
+    // Generation number that is increased each reset that frees resources.
+    uint64 m_instanceResourceGeneration = 0;
 };
 
 namespace entry
